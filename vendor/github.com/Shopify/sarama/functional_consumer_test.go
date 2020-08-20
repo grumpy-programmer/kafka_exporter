@@ -1,3 +1,5 @@
+//+build functional
+
 package sarama
 
 import (
@@ -8,13 +10,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestFuncConsumerOffsetOutOfRange(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	consumer, err := NewConsumer(kafkaBrokers, nil)
+	consumer, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +38,7 @@ func TestConsumerHighWaterMarkOffset(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	p, err := NewSyncProducer(kafkaBrokers, nil)
+	p, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +49,7 @@ func TestConsumerHighWaterMarkOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, err := NewConsumer(kafkaBrokers, nil)
+	c, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +85,7 @@ func TestVersionMatrix(t *testing.T) {
 	// protocol versions and compressions for the except of LZ4.
 	testVersions := versionRange(V0_8_2_0)
 	allCodecsButLZ4 := []CompressionCodec{CompressionNone, CompressionGZIP, CompressionSnappy}
-	producedMessages := produceMsgs(t, testVersions, allCodecsButLZ4, 17, 100)
+	producedMessages := produceMsgs(t, testVersions, allCodecsButLZ4, 17, 100, false)
 
 	// When/Then
 	consumeMsgs(t, testVersions, producedMessages)
@@ -98,10 +102,62 @@ func TestVersionMatrixLZ4(t *testing.T) {
 	// and all possible compressions.
 	testVersions := versionRange(V0_10_0_0)
 	allCodecs := []CompressionCodec{CompressionNone, CompressionGZIP, CompressionSnappy, CompressionLZ4}
-	producedMessages := produceMsgs(t, testVersions, allCodecs, 17, 100)
+	producedMessages := produceMsgs(t, testVersions, allCodecs, 17, 100, false)
 
 	// When/Then
 	consumeMsgs(t, testVersions, producedMessages)
+}
+
+// Support for zstd codec was introduced in v2.1.0.0
+func TestVersionMatrixZstd(t *testing.T) {
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	// Produce lot's of message with all possible combinations of supported
+	// protocol versions starting with v2.1.0.0 (first where zstd was supported)
+	testVersions := versionRange(V2_1_0_0)
+	allCodecs := []CompressionCodec{CompressionZSTD}
+	producedMessages := produceMsgs(t, testVersions, allCodecs, 17, 100, false)
+
+	// When/Then
+	consumeMsgs(t, testVersions, producedMessages)
+}
+
+func TestVersionMatrixIdempotent(t *testing.T) {
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	// Produce lot's of message with all possible combinations of supported
+	// protocol versions starting with v0.11 (first where idempotent was supported)
+	testVersions := versionRange(V0_11_0_0)
+	producedMessages := produceMsgs(t, testVersions, []CompressionCodec{CompressionNone}, 17, 100, true)
+
+	// When/Then
+	consumeMsgs(t, testVersions, producedMessages)
+}
+
+func TestReadOnlyAndAllCommittedMessages(t *testing.T) {
+	checkKafkaVersion(t, "0.11.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	config := NewConfig()
+	config.Consumer.IsolationLevel = ReadCommitted
+	config.Version = V0_11_0_0
+
+	consumer, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pc, err := consumer.ConsumePartition("uncommitted-topic-test-4", 0, OffsetOldest)
+	require.NoError(t, err)
+
+	msgChannel := pc.Messages()
+	for i := 1; i <= 6; i++ {
+		msg := <-msgChannel
+		require.Equal(t, fmt.Sprintf("Committed %v", i), string(msg.Value))
+	}
 }
 
 func prodMsg2Str(prodMsg *ProducerMessage) string {
@@ -133,7 +189,7 @@ func versionRange(lower KafkaVersion) []KafkaVersion {
 	return versions
 }
 
-func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []CompressionCodec, flush int, countPerVerCodec int) []*ProducerMessage {
+func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []CompressionCodec, flush int, countPerVerCodec int, idempotent bool) []*ProducerMessage {
 	var wg sync.WaitGroup
 	var producedMessagesMu sync.Mutex
 	var producedMessages []*ProducerMessage
@@ -145,8 +201,13 @@ func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []Compressi
 			prodCfg.Producer.Return.Errors = true
 			prodCfg.Producer.Flush.MaxMessages = flush
 			prodCfg.Producer.Compression = codec
+			prodCfg.Producer.Idempotent = idempotent
+			if idempotent {
+				prodCfg.Producer.RequiredAcks = WaitForAll
+				prodCfg.Net.MaxOpenRequests = 1
+			}
 
-			p, err := NewSyncProducer(kafkaBrokers, prodCfg)
+			p, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, prodCfg)
 			if err != nil {
 				t.Errorf("Failed to create producer: version=%s, compression=%s, err=%v", prodVer, codec, err)
 				continue
@@ -192,7 +253,7 @@ consumerVersionLoop:
 		// message.
 		consCfg := NewConfig()
 		consCfg.Version = consVer
-		c, err := NewConsumer(kafkaBrokers, consCfg)
+		c, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, consCfg)
 		if err != nil {
 			t.Fatal(err)
 		}
