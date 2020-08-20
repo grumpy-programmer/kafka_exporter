@@ -61,22 +61,29 @@ type Exporter struct {
 }
 
 type kafkaOpts struct {
-	uri                      []string
-	useSASL                  bool
-	useSASLHandshake         bool
-	saslUsername             string
-	saslPassword             string
-	saslMechanism            string
-	useTLS                   bool
-	tlsCAFile                string
-	tlsCertFile              string
-	tlsKeyFile               string
-	tlsInsecureSkipTLSVerify bool
-	kafkaVersion             string
-	useZooKeeperLag          bool
-	uriZookeeper             []string
-	labels                   string
-	metadataRefreshInterval  string
+	uri                          []string
+	useSASL                      bool
+	useSASLHandshake             bool
+	saslUsername                 string
+	saslPassword                 string
+	saslMechanism                string
+	saslGssApiServiceName        string
+	saslGssApiAuthType           string
+	saslGssApiKeyTabPath         string
+	saslGssApiKerberosConfigPath string
+	saslGssApiUsername           string
+	saslGssApiPassword           string
+	saslGssApiRealm              string
+	useTLS                       bool
+	tlsCAFile                    string
+	tlsCertFile                  string
+	tlsKeyFile                   string
+	tlsInsecureSkipTLSVerify     bool
+	kafkaVersion                 string
+	useZooKeeperLag              bool
+	uriZookeeper                 []string
+	labels                       string
+	metadataRefreshInterval      string
 }
 
 // CanReadCertAndKey returns true if the certificate and key files already exists,
@@ -130,26 +137,41 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 		switch opts.saslMechanism {
 		case "scram-sha512":
 			config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
-			config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA512)
+			config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 		case "scram-sha256":
 			config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA256} }
-			config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA256)
-
+			config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+		case "gssapi":
+			config.Net.SASL.Mechanism = sarama.SASLTypeGSSAPI
 		case "plain":
 		default:
-			plog.Fatalf("invalid sasl mechanism \"%s\": can only be \"scram-sha256\", \"scram-sha512\" or \"plain\"", opts.saslMechanism)
+			plog.Fatalf("invalid sasl mechanism \"%s\": can only be \"scram-sha256\", \"scram-sha512\", \"gssapi\" or \"plain\"", opts.saslMechanism)
 		}
 
 		config.Net.SASL.Enable = true
 		config.Net.SASL.Handshake = opts.useSASLHandshake
 
-		if opts.saslUsername != "" {
-			config.Net.SASL.User = opts.saslUsername
+		config.Net.SASL.User = opts.saslUsername
+		config.Net.SASL.Password = opts.saslPassword
+
+		opts.saslGssApiAuthType = strings.ToLower(opts.saslGssApiAuthType)
+		switch opts.saslGssApiAuthType {
+		case "user-auth":
+			config.Net.SASL.GSSAPI.AuthType = sarama.KRB5_USER_AUTH
+		case "keytab-auth":
+			config.Net.SASL.GSSAPI.AuthType = sarama.KRB5_KEYTAB_AUTH
+		case "":
+		default:
+			plog.Fatalf("invalid sasl gss auth type \"%s\": can only be \"user-auth\" or \"keytab-auth\"", opts.saslGssApiAuthType)
 		}
 
-		if opts.saslPassword != "" {
-			config.Net.SASL.Password = opts.saslPassword
-		}
+		config.Net.SASL.GSSAPI.ServiceName = opts.saslGssApiServiceName
+		config.Net.SASL.GSSAPI.KeyTabPath = opts.saslGssApiKeyTabPath
+		config.Net.SASL.GSSAPI.KerberosConfigPath = opts.saslGssApiKerberosConfigPath
+		config.Net.SASL.GSSAPI.Username = opts.saslGssApiUsername
+		config.Net.SASL.GSSAPI.Password = opts.saslGssApiPassword
+		config.Net.SASL.GSSAPI.Realm = opts.saslGssApiRealm
+
 	}
 
 	if opts.useTLS {
@@ -493,16 +515,27 @@ func main() {
 		opts = kafkaOpts{}
 	)
 	kingpin.Flag("kafka.server", "Address (host:port) of Kafka server.").Default("kafka:9092").StringsVar(&opts.uri)
+
 	kingpin.Flag("sasl.enabled", "Connect using SASL/PLAIN.").Default("false").BoolVar(&opts.useSASL)
 	kingpin.Flag("sasl.handshake", "Only set this to false if using a non-Kafka SASL proxy.").Default("true").BoolVar(&opts.useSASLHandshake)
 	kingpin.Flag("sasl.username", "SASL user name.").Default("").StringVar(&opts.saslUsername)
 	kingpin.Flag("sasl.password", "SASL user password.").Default("").StringVar(&opts.saslPassword)
-	kingpin.Flag("sasl.mechanism", "The SASL SCRAM SHA algorithm sha256 or sha512 as mechanism").Default("").StringVar(&opts.saslMechanism)
+	kingpin.Flag("sasl.mechanism", "The SASL SCRAM SHA algorithm sha256, sha512 or gssapi as mechanism").Default("").StringVar(&opts.saslMechanism)
+
+	kingpin.Flag("sasl.gssapi.service-name", "").Default("").StringVar(&opts.saslGssApiServiceName)
+	kingpin.Flag("sasl.gssapi.auth-type", "").Default("").StringVar(&opts.saslGssApiAuthType)
+	kingpin.Flag("sasl.gssapi.key-tab-path", "").Default("").StringVar(&opts.saslGssApiKeyTabPath)
+	kingpin.Flag("sasl.gssapi.kerberos-config-path", "").Default("").StringVar(&opts.saslGssApiKerberosConfigPath)
+	kingpin.Flag("sasl.gssapi.username", "").Default("").StringVar(&opts.saslGssApiUsername)
+	kingpin.Flag("sasl.gssapi.password", "").Default("").StringVar(&opts.saslGssApiPassword)
+	kingpin.Flag("sasl.gssapi.realm", "").Default("").StringVar(&opts.saslGssApiRealm)
+
 	kingpin.Flag("tls.enabled", "Connect using TLS.").Default("false").BoolVar(&opts.useTLS)
 	kingpin.Flag("tls.ca-file", "The optional certificate authority file for TLS client authentication.").Default("").StringVar(&opts.tlsCAFile)
 	kingpin.Flag("tls.cert-file", "The optional certificate file for client authentication.").Default("").StringVar(&opts.tlsCertFile)
 	kingpin.Flag("tls.key-file", "The optional key file for client authentication.").Default("").StringVar(&opts.tlsKeyFile)
 	kingpin.Flag("tls.insecure-skip-tls-verify", "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.").Default("false").BoolVar(&opts.tlsInsecureSkipTLSVerify)
+
 	kingpin.Flag("kafka.version", "Kafka broker version").Default(sarama.V1_0_0_0.String()).StringVar(&opts.kafkaVersion)
 	kingpin.Flag("use.consumelag.zookeeper", "if you need to use a group from zookeeper").Default("false").BoolVar(&opts.useZooKeeperLag)
 	kingpin.Flag("zookeeper.server", "Address (hosts) of zookeeper server.").Default("localhost:2181").StringsVar(&opts.uriZookeeper)
